@@ -89,13 +89,14 @@ be_service.slnx                       # solution root (build dari sini)
 **Prasyarat:** .NET 10 SDK; Qdrant, MinIO, Ollama, PostgreSQL/Supabase berjalan sebelum upload.
 
 ```bash
-# Qdrant
-docker run -p 6333:6333 qdrant/qdrant
+# Qdrant (expose port 6333 HTTP & 6334 gRPC, simpan data ke qdrant_data)
+docker run -d -p 6333:6333 -p 6334:6334 --name qdrant \
+  -v ${PWD}/qdrant_data:/qdrant/storage qdrant/qdrant
 
 # MinIO (console http://localhost:9001 — minioadmin/minioadmin; bucket rag-documents auto-dibuat)
 docker run -d -p 9000:9000 -p 9001:9001 --name minio \
   -e "MINIO_ROOT_USER=minioadmin" -e "MINIO_ROOT_PASSWORD=minioadmin" \
-  quay.io/minio/minio server /data --console-address ":9001"
+  cgr.dev/chainguard/minio server /data --console-address ":9001"
 
 # Ollama (http://localhost:11434)
 ollama serve

@@ -28,6 +28,13 @@ public class ApiKeyMiddleware
     {
         var path = context.Request.Path.Value ?? "";
 
+        if (context.Request.Path.StartsWithSegments("/swagger") || 
+            context.Request.Path.StartsWithSegments("/openapi"))
+        {
+            await _next(context);
+            return;
+        }
+
         if (path.StartsWith("/api/health", StringComparison.OrdinalIgnoreCase))
         {
             await _next(context);

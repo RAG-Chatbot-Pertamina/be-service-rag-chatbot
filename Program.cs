@@ -26,7 +26,12 @@ builder.Services.AddSingleton(sp =>
     var port = opts.GrpcPort > 0 ? opts.GrpcPort : QdrantOptions.DefaultGrpcPort;
     return new Qdrant.Client.QdrantClient(host, port, https: false);
 });
-builder.Services.AddHttpClient<OllamaService>();
+builder.Services.AddHttpClient<OllamaService>((sp, client) =>
+{
+    var opts = sp.GetRequiredService<IOptions<OllamaOptions>>().Value;
+    client.BaseAddress = new Uri(string.IsNullOrWhiteSpace(opts.BaseUrl) ? "http://localhost:11434" : opts.BaseUrl);
+    client.Timeout = TimeSpan.FromSeconds(opts.TimeoutSeconds > 0 ? opts.TimeoutSeconds : 300);
+});
 builder.Services.AddTransient<IChatService>(sp => sp.GetRequiredService<OllamaService>());
 builder.Services.AddTransient<IEmbeddingService>(sp => sp.GetRequiredService<OllamaService>());
 
