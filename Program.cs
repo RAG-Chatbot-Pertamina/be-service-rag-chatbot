@@ -103,13 +103,74 @@ if (app.Environment.IsDevelopment())
 }
 app.MapPost("/api/chat", async (
     ChatRequest request,
-    RagChatService ragChatService) =>
+    RagChatService ragChatService,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
 {
-    var response =
-        await ragChatService.AskAsync(request.Message);
+    if (httpContext.Request.Headers.Accept.ToString().Contains("text/event-stream") ||
+        httpContext.Request.Query.ContainsKey("stream"))
+    {
+        await StreamChatResponseAsync(httpContext, ragChatService, request.Message, cancellationToken);
+        return;
+    }
 
-    return Results.Ok(response);
+    var response = await ragChatService.AskAsync(request.Message);
+    await httpContext.Response.WriteAsJsonAsync(response, cancellationToken);
 });
+
+app.MapPost("/api/chat/stream", async (
+    ChatRequest request,
+    RagChatService ragChatService,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    await StreamChatResponseAsync(httpContext, ragChatService, request.Message, cancellationToken);
+});
+
+static async Task StreamChatResponseAsync(
+    HttpContext httpContext,
+    RagChatService ragChatService,
+    string message,
+    CancellationToken cancellationToken)
+{
+    httpContext.Response.ContentType = "text/event-stream";
+    httpContext.Response.Headers.CacheControl = "no-cache";
+    httpContext.Response.Headers.Connection = "keep-alive";
+    httpContext.Response.Headers["X-Accel-Buffering"] = "no";
+
+    try
+    {
+        await foreach (var streamEvent in ragChatService.AskStreamAsync(message, cancellationToken))
+        {
+            var dataJson = System.Text.Json.JsonSerializer.Serialize(streamEvent.Data);
+            var sseMessage = $"event: {streamEvent.Event}\ndata: {dataJson}\n\n";
+            await httpContext.Response.WriteAsync(sseMessage, cancellationToken);
+            await httpContext.Response.Body.FlushAsync(cancellationToken);
+        }
+    }
+    catch (OperationCanceledException)
+    {
+        // Client cancelled or disconnected
+    }
+    catch (ExternalServiceUnavailableException ex)
+    {
+        if (!httpContext.Response.HasStarted)
+            throw;
+
+        var errorJson = System.Text.Json.JsonSerializer.Serialize(new { error = ex.Error, message = ex.UserMessage });
+        await httpContext.Response.WriteAsync($"event: error\ndata: {errorJson}\n\n", cancellationToken);
+        await httpContext.Response.Body.FlushAsync(cancellationToken);
+    }
+    catch (Exception)
+    {
+        if (!httpContext.Response.HasStarted)
+            throw;
+
+        var errorJson = System.Text.Json.JsonSerializer.Serialize(new { error = "Internal server error", message = "Terjadi kesalahan pada server." });
+        await httpContext.Response.WriteAsync($"event: error\ndata: {errorJson}\n\n", cancellationToken);
+        await httpContext.Response.Body.FlushAsync(cancellationToken);
+    }
+}
 
 app.MapPost("/api/ingest", async (
     IngestRequest request,

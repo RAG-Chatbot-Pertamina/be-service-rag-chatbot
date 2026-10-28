@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text;
 using be_service.Abstractions;
 using be_service.Models;
@@ -98,6 +99,106 @@ public class OllamaService : IChatService, IEmbeddingService
         dynamic result = JsonConvert.DeserializeObject(json)!;
 
         return result.response.ToString();
+    }
+
+    public async IAsyncEnumerable<string> StreamChatAsync(
+        string prompt,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var request = new
+        {
+            model = ChatModel,
+            prompt = prompt,
+            stream = true
+        };
+
+        var requestJson = JsonConvert.SerializeObject(request);
+
+        HttpResponseMessage response;
+        try
+        {
+            var content = new StringContent(
+                requestJson,
+                Encoding.UTF8,
+                "application/json");
+
+            var httpRequest = new HttpRequestMessage(HttpMethod.Post, "api/generate")
+            {
+                Content = content
+            };
+
+            response = await HttpResponseGuard.SendAsync(
+                () => _httpClient.SendAsync(
+                    httpRequest,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken),
+                _logger,
+                "Ollama streaming generation",
+                BaseUrl
+            );
+        }
+        catch (OperationCanceledException)
+        {
+            yield break;
+        }
+
+        await HttpResponseGuard.EnsureSuccessAsync(
+            response,
+            _logger,
+            "Ollama streaming generation",
+            BaseUrl);
+
+        using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            string? line;
+            try
+            {
+                line = await reader.ReadLineAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                yield break;
+            }
+
+            if (line is null)
+                break;
+
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            string? token = null;
+            bool isDone = false;
+
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(line);
+                if (doc.RootElement.TryGetProperty("response", out var respProp))
+                {
+                    token = respProp.GetString();
+                }
+                if (doc.RootElement.TryGetProperty("done", out var doneProp))
+                {
+                    isDone = doneProp.GetBoolean();
+                }
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                // Ignore malformed line
+            }
+
+            if (!string.IsNullOrEmpty(token))
+            {
+                yield return token;
+            }
+
+            if (isDone)
+            {
+                break;
+            }
+        }
     }
 
     public async Task<string> CompleteAsync(

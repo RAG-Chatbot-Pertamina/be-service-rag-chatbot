@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using be_service.Models;
 using Microsoft.Extensions.Options;
@@ -41,13 +43,8 @@ public class RagChatService
         _ragMode = ragMode.Value;
     }
 
-    public async Task<ChatResponse> AskAsync(string question)
+    public async Task<RagQueryAnalysis> AnalyzeQuestionAsync(string question)
     {
-        question = (question ?? "").Trim();
-
-        if (string.IsNullOrWhiteSpace(question))
-            return NotFoundResponse();
-
         // Mode="Semantic" → LLM-based analysis; everything else → keyword cascade
         RagQueryAnalysis analysis;
         if (_ragMode.IsSemanticQueryMode)
@@ -80,6 +77,18 @@ public class RagChatService
             analysis = await _queryAnalyzerService.AnalyzeAsync(question);
         }
 
+        return analysis;
+    }
+
+    public async Task<ChatResponse> AskAsync(string question)
+    {
+        question = (question ?? "").Trim();
+
+        if (string.IsNullOrWhiteSpace(question))
+            return NotFoundResponse();
+
+        var analysis = await AnalyzeQuestionAsync(question);
+
         // Blocked check before any retrieval path
         if (analysis.IsBlocked)
             return new ChatResponse
@@ -87,7 +96,8 @@ public class RagChatService
                 Answer = string.IsNullOrWhiteSpace(analysis.BlockReason)
                     ? "Maaf, saya tidak menemukan informasi tersebut."
                     : analysis.BlockReason,
-                Sources = []
+                Sources = [],
+                RetrievedChunks = []
             };
 
         // Hybrid & Semantic: SemanticGrounded queries go to pure vector search
@@ -95,6 +105,162 @@ public class RagChatService
             return await AskSemanticAsync(analysis.Question);
 
         return await AskLegacyAsync(analysis);
+    }
+
+    public async IAsyncEnumerable<ChatStreamEvent> AskStreamAsync(
+        string question,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        question = (question ?? "").Trim();
+
+        if (string.IsNullOrWhiteSpace(question))
+        {
+            var notFound = "Maaf, saya tidak menemukan informasi tersebut.";
+            yield return ChatStreamEvent.Metadata([], []);
+            yield return ChatStreamEvent.Chunk(notFound);
+            yield return ChatStreamEvent.Done(notFound, [], []);
+            yield break;
+        }
+
+        var analysis = await AnalyzeQuestionAsync(question);
+
+        // Blocked check before any retrieval path
+        if (analysis.IsBlocked)
+        {
+            var blockMsg = string.IsNullOrWhiteSpace(analysis.BlockReason)
+                ? "Maaf, saya tidak menemukan informasi tersebut."
+                : analysis.BlockReason;
+
+            yield return ChatStreamEvent.Metadata([], []);
+            yield return ChatStreamEvent.Chunk(blockMsg);
+            yield return ChatStreamEvent.Done(blockMsg, [], []);
+            yield break;
+        }
+
+        if (_ragMode.UsesSemanticDispatch && analysis.AnswerLevel == AnswerLevel.SemanticGrounded)
+        {
+            await foreach (var evt in AskSemanticStreamAsync(analysis.Question, cancellationToken))
+            {
+                yield return evt;
+            }
+            yield break;
+        }
+
+        await foreach (var evt in AskLegacyStreamAsync(analysis, cancellationToken))
+        {
+            yield return evt;
+        }
+    }
+
+    private async IAsyncEnumerable<ChatStreamEvent> AskSemanticStreamAsync(
+        string question,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation(
+            "SEMANTIC_STREAM_PATH query length={Length}", question.Length);
+
+        var result = await _retrievalService.SearchSemanticOnlyAsync(question);
+        var sources = GetSources(result.Chunks);
+
+        yield return ChatStreamEvent.Metadata(sources, result.Chunks);
+
+        if (!result.Chunks.Any())
+        {
+            var notFound = "Maaf, saya tidak menemukan informasi tersebut.";
+            yield return ChatStreamEvent.Chunk(notFound);
+            yield return ChatStreamEvent.Done(notFound, sources, result.Chunks);
+            yield break;
+        }
+
+        var prompt = _promptBuilderService.BuildSemanticPrompt(question, result.Chunks);
+        var sb = new StringBuilder();
+
+        await foreach (var token in _ollamaService.StreamChatAsync(prompt, cancellationToken))
+        {
+            sb.Append(token);
+            yield return ChatStreamEvent.Chunk(token);
+        }
+
+        yield return ChatStreamEvent.Done(sb.ToString(), sources, result.Chunks);
+    }
+
+    private async IAsyncEnumerable<ChatStreamEvent> AskLegacyStreamAsync(
+        RagQueryAnalysis analysis,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var question = analysis.Question;
+
+        _logger.LogInformation(
+            "RAG stream query received, length={QueryLength}",
+            question.Length);
+
+        var retrievalResult = await _retrievalService.RetrieveAsync(analysis);
+
+        if (retrievalResult.AnswerLevel == AnswerLevel.Blocked ||
+            retrievalResult.RetrievalMode == "blocked")
+        {
+            var blockMsg = string.IsNullOrWhiteSpace(retrievalResult.BlockReason)
+                ? "Maaf, saya tidak menemukan informasi tersebut."
+                : retrievalResult.BlockReason;
+
+            yield return ChatStreamEvent.Metadata([], []);
+            yield return ChatStreamEvent.Chunk(blockMsg);
+            yield return ChatStreamEvent.Done(blockMsg, [], []);
+            yield break;
+        }
+
+        var relevantChunks = retrievalResult.Chunks;
+        var sources = GetSources(relevantChunks);
+
+        yield return ChatStreamEvent.Metadata(sources, relevantChunks);
+
+        if (!relevantChunks.Any())
+        {
+            LogAnswerTrace(
+                retrievalResult,
+                usedDeterministicAnswer: false,
+                usedLlm: false);
+
+            var notFound = "Maaf, saya tidak menemukan informasi tersebut.";
+            yield return ChatStreamEvent.Chunk(notFound);
+            yield return ChatStreamEvent.Done(notFound, sources, relevantChunks);
+            yield break;
+        }
+
+        var deterministicAnswer = _answerFormatterService.TryBuildDeterministicAnswer(
+            relevantChunks,
+            retrievalResult.RetrievalMode,
+            question);
+
+        if (!string.IsNullOrWhiteSpace(deterministicAnswer))
+        {
+            LogAnswerTrace(
+                retrievalResult,
+                usedDeterministicAnswer: true,
+                usedLlm: false);
+
+            yield return ChatStreamEvent.Chunk(deterministicAnswer);
+            yield return ChatStreamEvent.Done(deterministicAnswer, sources, relevantChunks);
+            yield break;
+        }
+
+        var prompt = retrievalResult.AnswerLevel == AnswerLevel.PolicyGrounded
+            ? _promptBuilderService.BuildPolicyGroundedPrompt(question, relevantChunks)
+            : _promptBuilderService.Build(question, relevantChunks);
+
+        var sb = new StringBuilder();
+        await foreach (var token in _ollamaService.StreamChatAsync(prompt, cancellationToken))
+        {
+            sb.Append(token);
+            yield return ChatStreamEvent.Chunk(token);
+        }
+
+        LogAnswerTrace(
+            retrievalResult,
+            usedDeterministicAnswer: false,
+            usedLlm: true);
+
+        yield return ChatStreamEvent.Done(sb.ToString(), sources, relevantChunks);
     }
 
     // --- Semantic-mode measurement: fallback rate + Semantic-vs-Legacy diff ---
@@ -410,7 +576,8 @@ public class RagChatService
         return new ChatResponse
         {
             Answer = answer,
-            Sources = GetSources(result.Chunks)
+            Sources = GetSources(result.Chunks),
+            RetrievedChunks = result.Chunks
         };
     }
 
@@ -434,7 +601,8 @@ public class RagChatService
                 Answer = string.IsNullOrWhiteSpace(retrievalResult.BlockReason)
                     ? "Maaf, saya tidak menemukan informasi tersebut."
                     : retrievalResult.BlockReason,
-                Sources = new List<string>()
+                Sources = new List<string>(),
+                RetrievedChunks = new List<RetrievedChunk>()
             };
         }
 
@@ -497,6 +665,7 @@ public class RagChatService
             {
                 Answer = deterministicAnswer,
                 Sources = GetSources(relevantChunks),
+                RetrievedChunks = relevantChunks
             };
         }
 
@@ -525,6 +694,7 @@ public class RagChatService
         {
             Answer = answer,
             Sources = GetSources(relevantChunks),
+            RetrievedChunks = relevantChunks
         };
     }
 
@@ -534,6 +704,7 @@ public class RagChatService
         {
             Answer = "Maaf, saya tidak menemukan informasi tersebut.",
             Sources = new List<string>(),
+            RetrievedChunks = new List<RetrievedChunk>()
         };
     }
 
